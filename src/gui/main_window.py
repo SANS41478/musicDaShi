@@ -594,9 +594,9 @@ class MainWindow(QMainWindow):
                 return None
 
             for i, wav_path in enumerate(wav_files):
+                self.status_bar.showMessage(f"正在解析: {wav_path.name}...")
                 midi_note = _parse_note_from_name(wav_path.stem)
                 if midi_note is None:
-                    # Fallback: assign starting from middle C
                     midi_note = 60 + i
                     logger.warning("Could not parse note from %s, assigned %d", wav_path.name, midi_note)
                 else:
@@ -609,7 +609,9 @@ class MainWindow(QMainWindow):
                     note_hi=min(127, midi_note + 2),
                 )
 
+            self.status_bar.showMessage(f"正在加载 {len(wav_files)} 个采样文件...")
             usp.load_samples()
+            self.status_bar.showMessage(f"已加载 {usp.sample_count} 个采样")
 
             name = usp.name
             base = name
@@ -622,8 +624,17 @@ class MainWindow(QMainWindow):
             self.voice_panel.set_available_voices(list(self._voice_providers.keys()))
             self.status_bar.showMessage(f"已加载 {usp.sample_count} 个自定义采样 → {name}")
         except Exception as e:
-            logger.exception("Failed to load user samples")
-            QMessageBox.critical(self, "错误", f"无法加载自定义采样:\n{e}")
+            import traceback
+            tb = traceback.format_exc()
+            logger.error("Failed to load user samples:\n%s", tb)
+            QMessageBox.critical(self, "加载采样失败",
+                f"无法加载采样文件。\n\n"
+                f"错误: {e}\n\n"
+                f"请确认:\n"
+                f"1) 文件夹中包含 .wav 文件\n"
+                f"2) WAV 文件没有损坏\n"
+                f"3) 磁盘有足够空间\n\n"
+                f"详细错误已输出到控制台")
 
     def _on_render(self):
         """Render the MIDI with current voice settings."""

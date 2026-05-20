@@ -19,3 +19,6 @@ samples/
 .DS_Store
 Thumbs.db
 .claude/
+fluidsynth_lib/
+fluidsynth.zip
+soundfonts/

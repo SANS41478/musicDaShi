@@ -2,6 +2,19 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 
+REM Add local FluidSynth DLLs to PATH
+if exist "%~dp0fluidsynth_lib\bin" (
+    set "PATH=%~dp0fluidsynth_lib\bin;%PATH%"
+)
+
+REM pyfluidsynth hardcodes C:\tools\fluidsynth\bin as DLL search path
+if not exist "C:\tools\fluidsynth\bin" (
+    mkdir "C:\tools\fluidsynth\bin" 2>nul
+    if exist "%~dp0fluidsynth_lib\bin\*.dll" (
+        xcopy /y /q "%~dp0fluidsynth_lib\bin\*.dll" "C:\tools\fluidsynth\bin\" 2>nul
+    )
+)
+
 echo === musicDaShi - Automatic Performance Engine ===
 echo.
 

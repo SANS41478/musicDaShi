@@ -168,6 +168,7 @@ class MainWindow(QMainWindow):
         # Right: Voice config panel
         self.voice_panel = VoiceConfigPanel()
         self.voice_panel.voice_changed.connect(self._on_voice_changed)
+        self.voice_panel.track_settings_changed.connect(self._on_track_settings_changed)
         self.voice_panel.add_sf2_requested.connect(self._on_add_sf2)
         self.voice_panel.add_synth_requested.connect(self._on_add_synth)
         self.voice_panel.add_user_samples_requested.connect(self._on_add_user_samples)
@@ -300,21 +301,46 @@ class MainWindow(QMainWindow):
     def _on_track_selected(self, track_index: int):
         """Handle track selection in the track view."""
         self.voice_panel.set_current_track(track_index)
-        # Show current voice assignment for this track
+        # Show current voice assignment and settings for this track
         config = self.engine._track_configs.get(track_index)
         if config:
             self.voice_panel.set_current_voice(config.voice.name)
+            self.voice_panel.set_track_settings(
+                volume=config.volume,
+                pan=config.pan,
+                transpose=config.transpose,
+                mute=config.mute,
+                solo=config.solo,
+            )
 
     def _on_voice_changed(self, track_index: int, voice_name: str):
         """Handle voice assignment change for a track."""
         voice = self._voice_providers.get(voice_name)
         if voice:
-            self.engine.set_voice_for_track(track_index, voice)
+            settings = self.voice_panel.get_track_settings()
+            self.engine.set_voice_for_track(
+                track_index, voice,
+                volume=settings["volume"],
+                pan=settings["pan"],
+                transpose=settings["transpose"],
+            )
             self.status_bar.showMessage(f"轨道 {track_index} → {voice_name}")
-            # Need to re-render
             if self._render_result:
                 self.btn_render.setText("重新渲染")
             self.btn_play.setEnabled(False)
+
+    def _on_track_settings_changed(self, track_index: int):
+        """Handle track setting change (volume/pan/transpose/mute/solo)."""
+        settings = self.voice_panel.get_track_settings()
+        config = self.engine._track_configs.get(track_index)
+        if config:
+            config.volume = settings["volume"]
+            config.pan = settings["pan"]
+            config.transpose = settings["transpose"]
+            config.mute = settings["mute"]
+            config.solo = settings["solo"]
+        if self._render_result:
+            self.btn_render.setText("重新渲染")
 
     def _on_add_sf2(self):
         """Add an SF2/SFZ soundfont."""
@@ -597,8 +623,20 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            audio = self._render_result.audio.copy()
+
+            # Apply reverb if requested
+            if settings.get("reverb"):
+                audio = self.mixer.apply_reverb(
+                    audio,
+                    self._render_result.sample_rate,
+                    room_size=settings["reverb_room"],
+                    damping=settings["reverb_damping"],
+                    wet_level=settings["reverb_wet"],
+                )
+
             self.mixer.export_wav(
-                self._render_result.audio,
+                audio,
                 file_path,
                 normalize=settings["normalize"],
                 fade_in=settings["fade_in"],

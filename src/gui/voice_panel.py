@@ -3,6 +3,7 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFrame,
     QGroupBox,
@@ -20,6 +21,7 @@ class VoiceConfigPanel(QWidget):
     """Panel for configuring voice assignments and track settings."""
 
     voice_changed = Signal(int, str)          # track_index, voice_name
+    track_settings_changed = Signal(int)       # track_index — emitted when volume/pan/transpose/mute/solo change
     add_sf2_requested = Signal()
     add_synth_requested = Signal()
     add_user_samples_requested = Signal()
@@ -58,6 +60,17 @@ class VoiceConfigPanel(QWidget):
         settings_group = QGroupBox("轨道设置")
         settings_layout = QVBoxLayout(settings_group)
 
+        # Mute / Solo
+        ms_row = QHBoxLayout()
+        self.mute_check = QCheckBox("静音 (Mute)")
+        self.mute_check.toggled.connect(lambda: self._emit_settings_changed())
+        ms_row.addWidget(self.mute_check)
+        self.solo_check = QCheckBox("独奏 (Solo)")
+        self.solo_check.toggled.connect(lambda: self._emit_settings_changed())
+        ms_row.addWidget(self.solo_check)
+        ms_row.addStretch()
+        settings_layout.addLayout(ms_row)
+
         # Volume
         vol_row = QHBoxLayout()
         vol_row.addWidget(QLabel("音量:"))
@@ -66,11 +79,25 @@ class VoiceConfigPanel(QWidget):
         self.volume_slider.setValue(100)
         self.volume_label = QLabel("100%")
         self.volume_slider.valueChanged.connect(
-            lambda v: self.volume_label.setText(f"{v}%")
+            lambda v: (self.volume_label.setText(f"{v}%"), self._emit_settings_changed())
         )
         vol_row.addWidget(self.volume_slider)
         vol_row.addWidget(self.volume_label)
         settings_layout.addLayout(vol_row)
+
+        # Pan
+        pan_row = QHBoxLayout()
+        pan_row.addWidget(QLabel("声像:"))
+        self.pan_slider = QSlider(Qt.Horizontal)
+        self.pan_slider.setRange(-100, 100)
+        self.pan_slider.setValue(0)
+        self.pan_label = QLabel("C")
+        self.pan_slider.valueChanged.connect(
+            lambda v: (self._update_pan_label(v), self._emit_settings_changed())
+        )
+        pan_row.addWidget(self.pan_slider)
+        pan_row.addWidget(self.pan_label)
+        settings_layout.addLayout(pan_row)
 
         # Transpose
         trans_row = QHBoxLayout()
@@ -79,6 +106,7 @@ class VoiceConfigPanel(QWidget):
         self.transpose_spin.setRange(-24, 24)
         self.transpose_spin.setValue(0)
         self.transpose_spin.setSuffix(" 半音")
+        self.transpose_spin.valueChanged.connect(lambda v: self._emit_settings_changed())
         trans_row.addWidget(self.transpose_spin)
         trans_row.addStretch()
         settings_layout.addLayout(trans_row)
@@ -108,6 +136,14 @@ class VoiceConfigPanel(QWidget):
         self._current_track = -1
         self._suppress_signal = False
 
+    def _update_pan_label(self, value: int):
+        if value < -33:
+            self.pan_label.setText(f"L{abs(value)}")
+        elif value > 33:
+            self.pan_label.setText(f"R{value}")
+        else:
+            self.pan_label.setText("C")
+
     def set_available_voices(self, voice_names: list[str]):
         """Update the voice dropdown with available voices."""
         self._suppress_signal = True
@@ -131,8 +167,35 @@ class VoiceConfigPanel(QWidget):
             self.voice_combo.setCurrentIndex(idx)
         self._suppress_signal = False
 
+    def set_track_settings(self, volume: float = 1.0, pan: float = 0.0,
+                           transpose: int = 0, mute: bool = False, solo: bool = False):
+        """Update all track setting controls from external values."""
+        self._suppress_signal = True
+        self.volume_slider.setValue(int(volume * 100))
+        self.pan_slider.setValue(int(pan * 100))
+        self.transpose_spin.setValue(transpose)
+        self.mute_check.setChecked(mute)
+        self.solo_check.setChecked(solo)
+        self._suppress_signal = False
+
+    def get_track_settings(self) -> dict:
+        """Get current track settings as a dictionary."""
+        return {
+            "volume": self.volume_slider.value() / 100.0,
+            "pan": self.pan_slider.value() / 100.0,
+            "transpose": self.transpose_spin.value(),
+            "mute": self.mute_check.isChecked(),
+            "solo": self.solo_check.isChecked(),
+        }
+
     def _on_voice_selected(self, voice_name: str):
         """Handle voice selection change."""
         if self._suppress_signal or self._current_track < 0:
             return
         self.voice_changed.emit(self._current_track, voice_name)
+
+    def _emit_settings_changed(self):
+        """Emit track_settings_changed when any setting control changes."""
+        if self._suppress_signal or self._current_track < 0:
+            return
+        self.track_settings_changed.emit(self._current_track)

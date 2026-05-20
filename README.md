@@ -131,10 +131,10 @@ musicDaShi/
 
 ## 开发流水线
 
-1. ✅ 架构规划 (当前)
-2. 项目骨架 + 依赖
-3. MIDI Parser
-4. Voice Provider 体系
-5. Engine + Mixer
-6. GUI
-7. 集成测试
+1. ✅ 架构规划
+2. ✅ 项目骨架 + 依赖
+3. ✅ MIDI Parser
+4. ✅ Voice Provider 体系
+5. ✅ Engine + Mixer
+6. ✅ GUI
+7. ✅ 集成测试

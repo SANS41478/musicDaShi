@@ -127,27 +127,28 @@ class UserSampleProvider(VoiceProvider):
 
     @staticmethod
     def _pitch_shift(data: np.ndarray, semitones: float, sr: int) -> np.ndarray:
-        """Simple pitch shifting by resampling.
+        """Pitch shift by resampling (changes duration proportionally).
 
-        Positive semitones = pitch up, negative = pitch down.
+        Uses FFT-based resampling for high quality.
+        Positive semitones = pitch up (shorter), negative = pitch down (longer).
         """
         if semitones == 0:
             return data.copy()
 
-        ratio = 2.0 ** (-semitones / 12.0)  # Note: negative for correct direction
-        old_indices = np.arange(len(data))
-        new_indices = old_indices * ratio
-        new_len = int(len(data) * ratio)
+        from scipy.signal import resample
 
-        if new_len < 1:
-            return np.zeros(0, dtype=np.float32)
+        ratio = 2.0 ** (-semitones / 12.0)
+        new_len = max(1, int(len(data) * ratio))
 
-        # Linear interpolation
-        result = np.interp(
-            np.linspace(0, len(data) - 1, new_len),
-            old_indices,
-            data,
-        )
+        # Edge-preserving window to reduce FFT boundary artifacts
+        window_len = min(len(data) // 8, 1024)
+        if window_len > 1:
+            fade = np.hanning(window_len * 2)
+            data = data.copy()
+            data[:window_len] *= fade[:window_len]
+            data[-window_len:] *= fade[window_len:]
+
+        result = resample(data, new_len)
         return result.astype(np.float32)
 
     def render(

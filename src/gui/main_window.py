@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSlider,
     QSplitter,
     QStatusBar,
     QVBoxLayout,
@@ -60,30 +61,43 @@ class RenderWorker(QThread):
 
 
 class PlaybackThread(QThread):
-    """Thread for real-time audio playback via sounddevice."""
+    """Thread for real-time audio playback via sounddevice with pause/seek support."""
 
+    position = Signal(float)   # Current playback position in seconds
     finished = Signal()
 
     def __init__(self, audio: np.ndarray, sample_rate: int):
         super().__init__()
         self.audio = audio
         self.sample_rate = sample_rate
+        self._device_rate = sample_rate
+        self._start_pos = 0       # Where to start playback (seconds)
+        self._paused = False
+        self._seek_to = -1        # Seek target position (-1 = none)
         self._stop = False
 
     def stop(self):
         self._stop = True
 
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def seek(self, position_seconds: float):
+        self._seek_to = max(0, min(position_seconds, len(self.audio) / self._device_rate))
+
     def run(self):
         try:
             import sounddevice as sd
 
-            # Resample if needed to match device rate
-            device_rate = sd.query_devices(kind="output")["default_samplerate"]
+            self._device_rate = sd.query_devices(kind="output")["default_samplerate"]
 
             audio = self.audio
-            if self.sample_rate != device_rate:
+            if self.sample_rate != self._device_rate:
                 from scipy import signal
-                ratio = device_rate / self.sample_rate
+                ratio = self._device_rate / self.sample_rate
                 if audio.ndim == 2:
                     audio = np.column_stack([
                         signal.resample(audio[:, 0], int(len(audio) * ratio)),
@@ -92,23 +106,40 @@ class PlaybackThread(QThread):
                 else:
                     audio = signal.resample(audio, int(len(audio) * ratio))
 
-            # Stream in chunks to allow stopping
             chunk_size = 1024
+            pos = int(self._start_pos * self._device_rate)
+
             stream = sd.OutputStream(
-                samplerate=device_rate,
+                samplerate=self._device_rate,
                 channels=audio.shape[1] if audio.ndim == 2 else 1,
                 dtype=np.float32,
             )
             stream.start()
 
-            pos = 0
             while pos < len(audio) and not self._stop:
+                # Handle seek
+                if self._seek_to >= 0:
+                    pos = int(self._seek_to * self._device_rate)
+                    self._seek_to = -1
+
+                # Handle pause
+                if self._paused:
+                    # Write silence while paused, wait for resume or stop
+                    silence = np.zeros((chunk_size, audio.shape[1] if audio.ndim == 2 else 1), dtype=np.float32)
+                    while self._paused and not self._stop:
+                        stream.write(silence)
+                        self.msleep(50)
+                    continue
+
                 end = min(pos + chunk_size, len(audio))
                 chunk = audio[pos:end]
                 if chunk.ndim == 1:
                     chunk = chunk.reshape(-1, 1)
                 stream.write(chunk)
                 pos = end
+
+                # Emit position
+                self.position.emit(pos / self._device_rate)
 
             stream.stop()
             stream.close()
@@ -136,6 +167,8 @@ class MainWindow(QMainWindow):
         self._render_worker: RenderWorker | None = None
         self._playback_thread: PlaybackThread | None = None
         self._voice_providers: dict[str, VoiceProvider] = {}
+        self._playback_position = 0.0  # Saved position for pause/resume
+        self._timeline_dragging = False
 
         # Default synth voice
         default_synth = SynthProvider(
@@ -178,6 +211,28 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(splitter)
 
         # Bottom: Transport controls
+
+        # Timeline
+        timeline_layout = QHBoxLayout()
+        self.label_time_current = QLabel("0:00")
+        self.label_time_current.setMinimumWidth(40)
+        timeline_layout.addWidget(self.label_time_current)
+
+        self.timeline_slider = QSlider(Qt.Horizontal)
+        self.timeline_slider.setRange(0, 1000)
+        self.timeline_slider.setValue(0)
+        self.timeline_slider.setEnabled(False)
+        self.timeline_slider.sliderPressed.connect(self._on_timeline_press)
+        self.timeline_slider.sliderReleased.connect(self._on_timeline_release)
+        timeline_layout.addWidget(self.timeline_slider, 1)
+
+        self.label_time_total = QLabel("0:00")
+        self.label_time_total.setMinimumWidth(40)
+        timeline_layout.addWidget(self.label_time_total)
+
+        main_layout.addLayout(timeline_layout)
+
+        # Transport buttons
         transport_layout = QHBoxLayout()
 
         self.btn_open = QPushButton("打开 MIDI")
@@ -471,40 +526,81 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "无采样文件", "所选文件夹中没有找到 .wav 文件。")
                 return
 
-            # Auto-map: assume files are named with MIDI note numbers
-            # e.g., "60.wav" = middle C, "C4.wav", or just assign sequentially
+            # Auto-map: parse note from filename
+            # Supports patterns like:
+            #   "60.wav", "C4.wav" (simple)
+            #   "._Steinway_A#5_Dyn3_RR1.wav" (underscore-separated, note in middle)
             note_map = {
-                "C": 0, "C#": 1, "Db": 1, "D": 2, "D#": 3, "Eb": 3,
-                "E": 4, "F": 5, "F#": 6, "Gb": 6, "G": 7, "G#": 8,
-                "Ab": 8, "A": 9, "A#": 10, "Bb": 10, "B": 11,
+                "C": 0, "C#": 1, "DB": 1, "D": 2, "D#": 3, "EB": 3,
+                "E": 4, "F": 5, "F#": 6, "GB": 6, "G": 7, "G#": 8,
+                "AB": 8, "A": 9, "A#": 10, "BB": 10, "B": 11,
             }
 
-            for i, wav_path in enumerate(wav_files):
-                # Try to extract note from filename
-                stem = wav_path.stem.upper()
+            # Regex: match note name like C4, F#3, Ab5, A#5
+            import re
+            note_pattern = re.compile(
+                r'([A-G])([#b]?)(\d{1,2})', re.IGNORECASE
+            )
 
-                midi_note = None
-                # Try pure number
+            def _parse_note_from_name(stem: str) -> int | None:
+                """Extract MIDI note number from a filename stem."""
+                # Try pure number first (e.g., "60")
                 try:
-                    midi_note = int(stem)
+                    return int(stem)
                 except ValueError:
                     pass
 
-                # Try note name like "C4", "F#3"
-                if midi_note is None and len(stem) >= 2:
-                    for note_name, semitone in note_map.items():
-                        if stem.startswith(note_name):
-                            octave_str = stem[len(note_name):]
-                            try:
-                                octave = int(octave_str)
-                                midi_note = (octave + 1) * 12 + semitone
-                            except ValueError:
-                                pass
-                            break
+                # Try underscore-separated segments (e.g., "._Steinway_A#5_Dyn3_RR1")
+                segments = stem.replace('.', '').split('_')
+                for seg in segments:
+                    m = note_pattern.search(seg)
+                    if m:
+                        note_name = m.group(1).upper()
+                        accidental = m.group(2).lower()
+                        octave = int(m.group(3))
+                        key = note_name
+                        if accidental == '#':
+                            key += '#'
+                        elif accidental == 'b':
+                            # Convert flat to sharp equivalent
+                            flat_map = {'C': 'B', 'D': 'C#', 'D': 'C#', 'E': 'D#', 'F': 'E',
+                                        'G': 'F#', 'A': 'G#', 'B': 'A#'}
+                            # Actually, just use the flat note map
+                            pass
+                        if accidental == 'b':
+                            # e.g., Db -> C#, Eb -> D#, Gb -> F#, Ab -> G#, Bb -> A#
+                            flat_equiv = {'DB': 'C#', 'EB': 'D#', 'GB': 'F#', 'AB': 'G#', 'BB': 'A#'}
+                            lookup = flat_equiv.get(key + 'B', key)
+                        else:
+                            lookup = key
+                        semitone = note_map.get(lookup)
+                        if semitone is not None:
+                            return (octave + 1) * 12 + semitone
 
-                # Fallback: assign starting from middle C
+                # Try the whole stem as a note+octave (e.g., "C4", "F#3")
+                m = note_pattern.match(stem.replace('.', '').strip())
+                if m:
+                    note_name = m.group(1).upper()
+                    accidental = m.group(2).lower()
+                    octave = int(m.group(3))
+                    key = note_name + ('#' if accidental == '#' else '')
+                    if accidental == 'b':
+                        flat_equiv = {'DB': 'C#', 'EB': 'D#', 'GB': 'F#', 'AB': 'G#', 'BB': 'A#'}
+                        key = flat_equiv.get(note_name + 'B', note_name)
+                    semitone = note_map.get(key)
+                    if semitone is not None:
+                        return (octave + 1) * 12 + semitone
+
+                return None
+
+            for i, wav_path in enumerate(wav_files):
+                midi_note = _parse_note_from_name(wav_path.stem)
                 if midi_note is None:
+                    # Fallback: assign starting from middle C
                     midi_note = 60 + i
+                    logger.warning("Could not parse note from %s, assigned %d", wav_path.name, midi_note)
+                else:
+                    logger.info("Parsed %s → MIDI note %d", wav_path.name, midi_note)
 
                 usp.add_sample(
                     file_path=wav_path,
@@ -554,11 +650,21 @@ class MainWindow(QMainWindow):
     def _on_render_finished(self, result: RenderResult):
         """Handle render completion."""
         self._render_result = result
+        self._playback_position = 0.0
         self.btn_render.setEnabled(True)
         self.btn_render.setText("重新渲染")
         self.btn_play.setEnabled(True)
+        self.btn_play.setText("播放")
+        self.btn_stop.setEnabled(False)
         self.btn_export.setEnabled(True)
         self.progress_bar.setVisible(False)
+
+        # Setup timeline
+        self.timeline_slider.setEnabled(True)
+        self.timeline_slider.setValue(0)
+        self.label_time_total.setText(self._format_time(result.duration))
+        self.label_time_current.setText("0:00")
+
         self.label_status.setText(
             f"渲染完成 — {result.note_count} 音符 | {result.duration:.1f}秒 | 用时 {result.render_time:.1f}秒"
         )
@@ -572,36 +678,113 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "渲染错误", error)
 
     def _on_play(self):
-        """Play the rendered audio."""
+        """Play the rendered audio, or pause/resume."""
         if self._render_result is None:
             return
 
-        self.btn_play.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.label_status.setText("播放中...")
+        # If currently playing, pause
+        if self._playback_thread and self._playback_thread.isRunning() and not self._playback_thread._paused:
+            self._playback_thread.pause()
+            self.btn_play.setText("继续")
+            self.btn_stop.setEnabled(True)
+            self.label_status.setText("已暂停")
+            return
 
+        # If paused, resume
+        if self._playback_thread and self._playback_thread.isRunning() and self._playback_thread._paused:
+            self._playback_thread.resume()
+            self.btn_play.setText("暂停")
+            self.btn_stop.setEnabled(True)
+            self.label_status.setText("播放中...")
+            return
+
+        # Start new playback from _playback_position
+        self._stop_playback()
         self._playback_thread = PlaybackThread(
             self._render_result.audio, self._render_result.sample_rate
         )
+        self._playback_thread._start_pos = self._playback_position
+        self._playback_thread.position.connect(self._on_playback_position)
         self._playback_thread.finished.connect(self._on_playback_finished)
         self._playback_thread.start()
 
+        self.btn_play.setText("暂停")
+        self.btn_stop.setEnabled(True)
+        self.label_status.setText("播放中...")
+
     def _on_stop(self):
-        """Stop playback."""
-        if self._playback_thread and self._playback_thread.isRunning():
-            self._playback_thread.stop()
+        """Stop playback and reset position."""
+        self._stop_playback()
+        self._playback_position = 0.0
+        self.timeline_slider.setValue(0)
+        self.label_time_current.setText("0:00")
+        self.btn_play.setText("播放")
         self.btn_play.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.label_status.setText("已停止")
 
+    def _stop_playback(self):
+        """Internal: stop playback thread if running."""
+        if self._playback_thread and self._playback_thread.isRunning():
+            self._playback_thread.stop()
+            self._playback_thread.wait(1000)
+
+    def _on_playback_position(self, position: float):
+        """Update timeline slider during playback."""
+        if not self._timeline_dragging:
+            self.timeline_slider.blockSignals(True)
+            if self._render_result:
+                ratio = position / self._render_result.duration if self._render_result.duration > 0 else 0
+                self.timeline_slider.setValue(int(ratio * 1000))
+                self.label_time_current.setText(self._format_time(position))
+            self.timeline_slider.blockSignals(False)
+        self._playback_position = position
+
     def _on_playback_finished(self):
         """Handle playback completion."""
+        self.btn_play.setText("播放")
         self.btn_play.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        if self._playback_thread and self._playback_thread._stop:
+            # Deliberate stop
+            pass
+        else:
+            # Natural end — reset position
+            self._playback_position = 0.0
+            self.timeline_slider.setValue(0)
+            self.label_time_current.setText("0:00")
         if self._render_result:
             self.label_status.setText(
                 f"渲染完成 — {self._render_result.note_count} 音符 | {self._render_result.duration:.1f}秒"
             )
+
+    def _on_timeline_press(self):
+        """User starts dragging the timeline slider."""
+        self._timeline_dragging = True
+        if self._playback_thread and self._playback_thread.isRunning():
+            self._playback_thread.pause()
+            self.btn_play.setText("继续")
+
+    def _on_timeline_release(self):
+        """User releases the timeline slider — seek to position."""
+        self._timeline_dragging = False
+        if self._render_result:
+            ratio = self.timeline_slider.value() / 1000.0
+            self._playback_position = ratio * self._render_result.duration
+            self.label_time_current.setText(self._format_time(self._playback_position))
+
+            if self._playback_thread and self._playback_thread.isRunning():
+                self._playback_thread.seek(self._playback_position)
+                self._playback_thread.resume()
+                self.btn_play.setText("暂停")
+                self.label_status.setText("播放中...")
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        """Format seconds as M:SS or M:SS.ms."""
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m}:{s:02d}"
 
     def _on_export(self):
         """Export rendered audio to WAV."""
@@ -653,11 +836,14 @@ class MainWindow(QMainWindow):
             "关于 musicDaShi",
             "<h2>musicDaShi — 自动演奏引擎</h2>"
             "<p>将 MIDI 乐谱 + 乐器采样自动合成为音频。</p>"
-            "<p>支持三种音色来源:</p>"
+            "<p><b>三种音色来源:</b></p>"
             "<ul>"
-            "<li>SF2/SFZ 标准采样库 (FluidSynth)</li>"
-            "<li>波形合成器</li>"
-            "<li>用户自定义 WAV 采样</li>"
+            "<li><b>合成器</b> — 纯波形合成 (正弦/方波/锯齿/三角/噪声)，无需额外依赖</li>"
+            "<li><b>SF2/SFZ 音色库</b> — SoundFont 格式，专业音色库，"
+            "需要 FluidSynth C 库。<br>"
+            "下载: <a href='https://sites.google.com/site/soundfonts4u/'>SoundFonts4U</a> "
+            "或 <a href='https://musical-artifacts.com/'>Musical Artifacts</a></li>"
+            "<li><b>自定义 WAV 采样</b> — 加载自己的 .wav 采样文件，自动识别音符</li>"
             "</ul>"
-            "<p><b>技术栈:</b> Python + PySide6 + FluidSynth + numpy</p>",
+            "<p><b>技术栈:</b> Python + PySide6 + numpy + mido + soundfile</p>",
         )

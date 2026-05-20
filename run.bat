@@ -1,17 +1,17 @@
 @echo off
+chcp 65001 >nul
 cd /d "%~dp0"
 
-echo === musicDaShi — 自动演奏引擎 ===
+echo === musicDaShi - Automatic Performance Engine ===
 echo.
 
-REM Check if dependencies need installing
-python -c "import PySide6, mido, numpy, soundfile, scipy, sounddevice" 2>nul
+python -c "import PySide6, mido, numpy, soundfile, scipy, sounddevice" >nul 2>&1
 if %errorlevel% neq 0 (
-    echo 正在安装依赖...
-    pip install -r requirements.txt
+    echo Installing dependencies...
+    pip install -r "%~dp0requirements.txt"
     echo.
 )
 
-echo 启动应用中...
+echo Starting...
 python -m src.main
 pause

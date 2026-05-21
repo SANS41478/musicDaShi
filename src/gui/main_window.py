@@ -520,11 +520,31 @@ class MainWindow(QMainWindow):
         try:
             usp = UserSampleProvider(name="自定义采样")
             folder_path = Path(folder)
+
+            # Warn if user selected a __MACOSX folder
+            if folder_path.name == "__MACOSX" or "__MACOSX" in folder_path.parts:
+                QMessageBox.warning(
+                    self, "提示",
+                    f"你选择了 '__MACOSX' 文件夹，里面是 macOS 的资源分支文件，不是真正的采样。\n\n"
+                    f"真实采样在同一个压缩包里，例如:\n"
+                    f"{folder_path.parent / 'Samples'}\n\n"
+                    f"请重新选择正确的采样文件夹。"
+                )
+                return
+
             wav_files = sorted(folder_path.glob("*.wav"))
 
-            if not wav_files:
-                QMessageBox.warning(self, "无采样文件", "所选文件夹中没有找到 .wav 文件。")
+            # Filter out macOS resource fork files (._ prefix)
+            real_files = [f for f in wav_files if not f.name.startswith("._")]
+            skipped = len(wav_files) - len(real_files)
+            if skipped > 0:
+                logger.warning("Skipped %d macOS resource fork files (._ prefix)", skipped)
+
+            if not real_files:
+                QMessageBox.warning(self, "无采样文件", "所选文件夹中没有找到有效的 .wav 文件。")
                 return
+
+            wav_files = real_files
 
             # Auto-map: parse note from filename
             # Supports patterns like:
